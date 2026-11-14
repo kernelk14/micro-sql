@@ -1,0 +1,44 @@
+{
+  "name": "micro-sql",
+  "version": "0.1.0",
+  "description": "Zero-dependency embedded SQL database with configurable SQLite, PostgreSQL and MySQL dialects for Node.js and modern browsers.",
+  "type": "module",
+  "main": "./src/index.js",
+  "types": "./src/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./src/index.d.ts",
+      "default": "./src/index.js"
+    },
+    "./dialects": {
+      "types": "./src/dialects/index.d.ts",
+      "default": "./src/dialects/index.js"
+    },
+    "./adapter": {
+      "types": "./src/adapter.d.ts",
+      "default": "./src/adapter.js"
+    }
+  },
+  "files": [
+    "src",
+    "README.md"
+  ],
+  "scripts": {
+    "test": "node --test",
+    "example": "node examples/node-demo.js"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "keywords": [
+    "sql",
+    "database",
+    "embedded",
+    "in-memory",
+    "sqlite",
+    "postgresql",
+    "mysql",
+    "zero-dependency"
+  ],
+  "license": "MIT"
+}
