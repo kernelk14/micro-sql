@@ -17,6 +17,26 @@
     "./adapter": {
       "types": "./src/adapter.d.ts",
       "default": "./src/adapter.js"
+    },
+    "./client": {
+      "types": "./src/client.d.ts",
+      "default": "./src/client.js"
+    }
+  },
+  "peerDependencies": {
+    "better-sqlite3": ">=9",
+    "mysql2": ">=3",
+    "pg": ">=8"
+  },
+  "peerDependenciesMeta": {
+    "better-sqlite3": {
+      "optional": true
+    },
+    "mysql2": {
+      "optional": true
+    },
+    "pg": {
+      "optional": true
     }
   },
   "files": [
@@ -38,7 +58,8 @@
     "sqlite",
     "postgresql",
     "mysql",
-    "zero-dependency"
+    "zero-dependency",
+    "driver"
   ],
   "license": "MIT"
 }

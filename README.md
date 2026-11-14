@@ -7,6 +7,10 @@ The store is in memory. The SQL parser, execution engine, value rules and
 error reporting are shared; each dialect supplies its own lexical rules,
 quoting, type names, coercion and comparison semantics.
 
+A separate `micro-sql/client` entry point runs statements against a real
+SQLite, PostgreSQL or MySQL database with the same API surface (see
+[Connecting to a real database](#connecting-to-a-real-database)).
+
 ```js
 import { Database } from 'micro-sql';
 
@@ -176,6 +180,97 @@ localStorage.setItem('db', JSON.stringify(snapshot));
 `fromJSON` accepts the parsed snapshot or a JSON string and takes an optional
 `{ dialect }` override. Invalid snapshots raise `ADAPTER_ERROR`.
 
+## Connecting to a real database
+
+`micro-sql/client` sends statements to a live database instead of the
+in-memory engine. The methods mirror `Database`, but they return promises
+because the drivers are asynchronous.
+
+```js
+import { connect } from 'micro-sql/client';
+
+const db = await connect({ dialect: 'sqlite', filename: './app.db' });
+
+await db.exec('CREATE TABLE IF NOT EXISTS users (id INTEGER PRIMARY KEY, name TEXT NOT NULL)');
+await db.run('INSERT INTO users (name) VALUES (?)', ['Ada']);
+
+const rows = await db.all('SELECT * FROM users WHERE name = :name', { name: 'Ada' });
+
+await db.transaction(async (tx) => {
+  await tx.run('INSERT INTO users (name) VALUES (?)', ['Alan']);
+});
+
+await db.close();
+```
+
+### Connection options
+
+| Dialect      | Options                                  | Driver                                   |
+| ------------ | ---------------------------------------- | ---------------------------------------- |
+| `sqlite`     | `filename` (defaults to `':memory:'`)     | `node:sqlite` (Node 22.5+) or `better-sqlite3` |
+| `postgres`   | `connectionString`                       | `pg`                                     |
+| `mysql`      | `connectionString`                       | `mysql2`                                 |
+
+```js
+const pg = await connect({ dialect: 'postgres', connectionString: process.env.DATABASE_URL });
+const my = await connect({ dialect: 'mysql', connectionString: 'mysql://user:pass@localhost:3306/app' });
+```
+
+`filename`, `connectionString`/`url` and `connectionOptions` (passed through
+to the driver: TLS, timeouts, and so on) are accepted. `pg`, `mysql2` and
+`better-sqlite3` are optional peer dependencies; install only the one you use.
+SQLite needs no package at all on Node 22.5+.
+
+### Client API
+
+`client.run`, `all`, `get`, `exec` and `prepare` follow the same rules as
+`Database`, but every call returns a promise. `client.transaction(fn)` wraps
+the callback in `BEGIN`/`COMMIT` and issues `ROLLBACK` if it throws.
+`client.close()` ends the connection and is safe to call twice.
+
+`run` also accepts `INSERT`, `UPDATE` and `DELETE` statements with a
+`RETURNING` clause. Those resolve to `{ changes, lastInsertRowid, rows }`, so a
+generated key can be read without a second query:
+
+```js
+const { lastInsertRowid, rows } = await db.run(
+  'INSERT INTO users (name) VALUES (?) RETURNING id, name',
+  ['Ada']
+);
+```
+
+`exec` splits statements on semicolons outside quotes and comments and returns
+one result per statement. As with `Database#exec`, the supplied parameters
+apply to every statement, so a statement without placeholders rejects extra
+values with `PARAMETER_ERROR`.
+
+### Parameters
+
+Any placeholder style is accepted and rewritten to what the driver expects:
+`?`, `$1`, `:name`, `@name` and `$name`. MySQL `??` identifier escapes are
+kept for `mysql2`. Boolean values bind as `0`/`1` on SQLite and MySQL and as
+`true`/`false` on PostgreSQL.
+
+Only the parameters are scanned; the SQL text is not parsed. Statements the
+in-memory engine does not support (`ALTER TABLE`, subqueries, casts) therefore
+pass straight through to the server.
+
+### Differences from the in-memory engine
+
+- `INSERT ... RETURNING` is supported on all three drivers. `lastInsertRowid`
+  comes from the driver when it reports one (SQLite, MySQL) and otherwise from
+  the first column of the first returned row, which is how PostgreSQL exposes
+  serial ids. A write without `RETURNING` reports `0` there.
+- Type coercion and constraint enforcement are the server's, not the dialect
+  profile's.
+- Driver errors become `SqlError`s with the matching code when one is known
+  (`UNIQUE_CONSTRAINT`, `NOT_NULL_CONSTRAINT`, `MISSING_TABLE`,
+  `MISSING_COLUMN`, `TABLE_EXISTS`, `SYNTAX_ERROR`, `DIVISION_BY_ZERO`,
+  `TYPE_ERROR`). Everything else, including connection failures, raises
+  `DRIVER_ERROR`. The original error is kept as `error.cause`.
+- A custom driver may be passed as `driver` (implementing `query`, `exec` and
+  `close`) to reuse an existing pool.
+
 ## TypeScript
 
 Type declarations ship with the package for all three entry points. Branded
@@ -185,6 +280,7 @@ result types (`Row`, `RunResult`, `ExecResult`, `DatabaseSnapshot`) and
 ```ts
 import { Database, type Row } from 'micro-sql';
 import { toJSON } from 'micro-sql/adapter';
+import { connect } from 'micro-sql/client';
 import { getDialect } from 'micro-sql/dialects';
 
 const db = new Database({ dialect: 'postgres' });
@@ -198,7 +294,7 @@ Every failure is a `SqlError` with a stable `code` (`SYNTAX_ERROR`,
 `UNSUPPORTED`, `INVALID_QUERY`, `MISSING_TABLE`, `TABLE_EXISTS`,
 `MISSING_COLUMN`, `DUPLICATE_COLUMN`, `TYPE_ERROR`, `UNSUPPORTED_TYPE`,
 `NOT_NULL_CONSTRAINT`, `UNIQUE_CONSTRAINT`, `PARAMETER_ERROR`,
-`DIVISION_BY_ZERO`, `ADAPTER_ERROR`). Syntax errors also carry `sql`,
+`DIVISION_BY_ZERO`, `ADAPTER_ERROR`, `DRIVER_ERROR`). Syntax errors also carry `sql`,
 `position`, `line` and `column`.
 
 ```js

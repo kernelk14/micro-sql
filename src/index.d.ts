@@ -76,6 +76,7 @@ export const ErrorCodes: {
   readonly PARAMETER_ERROR: 'PARAMETER_ERROR';
   readonly DIVISION_BY_ZERO: 'DIVISION_BY_ZERO';
   readonly ADAPTER_ERROR: 'ADAPTER_ERROR';
+  readonly DRIVER_ERROR: 'DRIVER_ERROR';
 };
 
 export type ErrorCode = (typeof ErrorCodes)[keyof typeof ErrorCodes];
