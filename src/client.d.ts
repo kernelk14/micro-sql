@@ -44,13 +44,28 @@ export interface ConnectOptions {
   dialect?: DialectName | string | BaseDialect;
   /** SQLite database file; defaults to `':memory:'`. */
   filename?: string;
-  /** PostgreSQL or MySQL URL (`postgres://...`, `mysql://...`). */
+  /** Server URL (`postgres://...`, `mysql://...`). */
   connectionString?: string;
   /** Alias for `connectionString`. */
   url?: string;
-  /** Extra options forwarded to the underlying driver. */
+  /** Server host; defaults to `localhost`. */
+  host?: string;
+  /** Server port; defaults to 5432 for PostgreSQL and 3306 for MySQL. */
+  port?: number;
+  /** Login role or user. */
+  user?: string;
+  password?: string;
+  /** Database to connect to. */
+  database?: string;
+  /**
+   * TLS policy: `'disable'`, `'prefer'`, `'require'` or `'verify-full'`.
+   * PostgreSQL defaults to `'prefer'`; MySQL only uses TLS when asked.
+   */
+  ssl?: boolean | string | Record<string, unknown>;
+  sslmode?: string;
+  /** Other protocol settings (timeouts, TLS extras, ...). */
   connectionOptions?: Record<string, unknown>;
-  /** Use a custom driver instead of the bundled adapter. */
+  /** Use a custom driver instead of the bundled protocol implementation. */
   driver?: ClientDriver;
 }
 

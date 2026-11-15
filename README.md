@@ -8,7 +8,9 @@ error reporting are shared; each dialect supplies its own lexical rules,
 quoting, type names, coercion and comparison semantics.
 
 A separate `micro-sql/client` entry point runs statements against a real
-SQLite, PostgreSQL or MySQL database with the same API surface (see
+SQLite, PostgreSQL or MySQL database with the same API surface. The
+PostgreSQL and MySQL wire protocols are implemented here rather than delegated
+to a driver package (see
 [Connecting to a real database](#connecting-to-a-real-database)).
 
 ```js
@@ -183,8 +185,10 @@ localStorage.setItem('db', JSON.stringify(snapshot));
 ## Connecting to a real database
 
 `micro-sql/client` sends statements to a live database instead of the
-in-memory engine. The methods mirror `Database`, but they return promises
-because the drivers are asynchronous.
+in-memory engine. PostgreSQL and MySQL/MariaDB are spoken to directly: this
+package implements their wire protocols over `node:net`/`node:tls`, so no
+database driver has to be installed. The methods mirror `Database`, but they
+return promises because the connection is asynchronous.
 
 ```js
 import { connect } from 'micro-sql/client';
@@ -205,21 +209,53 @@ await db.close();
 
 ### Connection options
 
-| Dialect      | Options                                  | Driver                                   |
-| ------------ | ---------------------------------------- | ---------------------------------------- |
-| `sqlite`     | `filename` (defaults to `':memory:'`)     | `node:sqlite` (Node 22.5+) or `better-sqlite3` |
-| `postgres`   | `connectionString`                       | `pg`                                     |
-| `mysql`      | `connectionString`                       | `mysql2`                                 |
+| Dialect    | Options                                                                  | Transport                                      |
+| ---------- | ------------------------------------------------------------------------ | ---------------------------------------------- |
+| `sqlite`   | `filename` (defaults to `':memory:'`)                                     | `node:sqlite` (Node 22.5+), `better-sqlite3` as fallback |
+| `postgres` | `connectionString`, `host`, `port` (5432), `user`, `password`, `database`, `ssl`/`sslmode` | PostgreSQL protocol 3.0 over TCP or TLS        |
+| `mysql`    | `connectionString`, `host`, `port` (3306), `user`, `password`, `database`, `ssl`/`sslmode` | MySQL protocol 10 over TCP or TLS              |
 
 ```js
 const pg = await connect({ dialect: 'postgres', connectionString: process.env.DATABASE_URL });
-const my = await connect({ dialect: 'mysql', connectionString: 'mysql://user:pass@localhost:3306/app' });
+const my = await connect({ dialect: 'mysql', host: 'localhost', user: 'app', password: 'secret', database: 'app' });
 ```
 
-`filename`, `connectionString`/`url` and `connectionOptions` (passed through
-to the driver: TLS, timeouts, and so on) are accepted. `pg`, `mysql2` and
-`better-sqlite3` are optional peer dependencies; install only the one you use.
-SQLite needs no package at all on Node 22.5+.
+A URL supplies the defaults (`postgres://user:pass@host:5432/db?sslmode=require`),
+`connectionOptions` overrides individual fields, and the top-level shortcuts
+(`host`, `port`, `user`, `password`, `database`, `ssl`, `sslmode`) win over
+both. `connectTimeout` (default 10000 ms) bounds the TCP and TLS handshakes.
+
+SQLite is an embedded file format rather than a network protocol, so it is
+read and written through Node's built-in `node:sqlite` binding. On older Node
+releases the optional `better-sqlite3` peer dependency is used instead.
+PostgreSQL and MySQL need no package at all.
+
+### TLS
+
+`sslmode` (or `ssl`) controls transport security:
+
+| Value                                   | Behaviour                                                        |
+| --------------------------------------- | ---------------------------------------------------------------- |
+| `disable`                               | Plain TCP. MySQL's default.                                     |
+| `prefer`                                | TLS when the server offers it, plain TCP otherwise. PostgreSQL's default. |
+| `require`                               | TLS, but the server certificate is not verified.                 |
+| `verify-ca`, `verify-full`, `verify`    | TLS with certificate verification.                               |
+
+Pass an object as `ssl` to hand extra options (`ca`, `cert`, `key`,
+`rejectUnauthorized`, ...) to `node:tls`. PostgreSQL negotiates TLS with an
+SSLRequest before the startup message; MySQL upgrades the connection after
+the server's handshake packet.
+
+### Authentication
+
+- PostgreSQL: cleartext, MD5, and SCRAM-SHA-256 (including the server
+  signature check).
+- MySQL: `mysql_native_password`, `caching_sha2_password` (fast path and full
+  authentication over TLS or with the server's RSA public key) and
+  `mysql_clear_password`.
+
+Passwords are only sent over the connection as each protocol requires; use
+`sslmode: 'require'` or stronger when the server is not on a trusted network.
 
 ### Client API
 
@@ -246,14 +282,31 @@ values with `PARAMETER_ERROR`.
 
 ### Parameters
 
-Any placeholder style is accepted and rewritten to what the driver expects:
+Any placeholder style is accepted and rewritten to what the server expects:
 `?`, `$1`, `:name`, `@name` and `$name`. MySQL `??` identifier escapes are
-kept for `mysql2`. Boolean values bind as `0`/`1` on SQLite and MySQL and as
-`true`/`false` on PostgreSQL.
+kept for MySQL. Boolean values bind as `0`/`1` on SQLite and MySQL and as
+`true`/`false` on PostgreSQL. Statements without parameters use the simple
+query protocol; parameterised ones are prepared and executed with bound
+values (extended query on PostgreSQL, `COM_STMT_PREPARE`/`COM_STMT_EXECUTE`
+on MySQL).
 
 Only the parameters are scanned; the SQL text is not parsed. Statements the
 in-memory engine does not support (`ALTER TABLE`, subqueries, casts) therefore
 pass straight through to the server.
+
+### Result decoding
+
+Values arrive in each protocol's native encoding and are decoded before they
+reach your code:
+
+- PostgreSQL text values are decoded by type OID: booleans become `true`/
+  `false`, `int2`/`int4`/`oid` and `int8` (when it fits) become numbers,
+  `float4`/`float8` become numbers, `numeric` stays a string to avoid losing
+  precision, and `bytea` becomes a `Buffer`.
+- MySQL text and binary result sets are decoded from their column types;
+  `TINYINT(1)` is not special-cased, so booleans come back as `0`/`1` unless
+  the query casts them.
+- SQLite values keep the types `node:sqlite` returns.
 
 ### Differences from the in-memory engine
 
@@ -263,13 +316,15 @@ pass straight through to the server.
   serial ids. A write without `RETURNING` reports `0` there.
 - Type coercion and constraint enforcement are the server's, not the dialect
   profile's.
-- Driver errors become `SqlError`s with the matching code when one is known
+- Server errors become `SqlError`s with the matching code when one is known
   (`UNIQUE_CONSTRAINT`, `NOT_NULL_CONSTRAINT`, `MISSING_TABLE`,
   `MISSING_COLUMN`, `TABLE_EXISTS`, `SYNTAX_ERROR`, `DIVISION_BY_ZERO`,
-  `TYPE_ERROR`). Everything else, including connection failures, raises
+  `TYPE_ERROR`). SQLSTATE values from PostgreSQL and `ER_*` numbers from MySQL
+  drive the mapping. Everything else, including connection failures, raises
   `DRIVER_ERROR`. The original error is kept as `error.cause`.
 - A custom driver may be passed as `driver` (implementing `query`, `exec` and
-  `close`) to reuse an existing pool.
+  `close`) to reuse an existing pool or to reach a server this package has no
+  protocol for. It replaces the bundled implementation for that connection.
 
 ## TypeScript
 

@@ -24,18 +24,10 @@
     }
   },
   "peerDependencies": {
-    "better-sqlite3": ">=9",
-    "mysql2": ">=3",
-    "pg": ">=8"
+    "better-sqlite3": ">=9"
   },
   "peerDependenciesMeta": {
     "better-sqlite3": {
-      "optional": true
-    },
-    "mysql2": {
-      "optional": true
-    },
-    "pg": {
       "optional": true
     }
   },
