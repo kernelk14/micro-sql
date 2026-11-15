@@ -21,8 +21,12 @@ export class Engine {
     this.dialect = dialect;
     /** @type {Map<string, object>} */
     this.tables = new Map();
+    /** @type {Map<string, object>} index metadata declared with CREATE INDEX */
+    this.indexes = new Map();
     /** @type {Map<string, object>|null} tables captured at BEGIN */
     this.transactionSnapshot = null;
+    /** @type {Map<string, object>|null} indexes captured at BEGIN */
+    this.indexSnapshot = null;
   }
 
   /**
@@ -44,6 +48,12 @@ export class Engine {
         return this.executeCreateTable(statement, bind);
       case 'DropTable':
         return this.executeDropTable(statement);
+      case 'AlterTable':
+        return this.executeAlterTable(statement, bind);
+      case 'CreateIndex':
+        return this.executeCreateIndex(statement);
+      case 'DropIndex':
+        return this.executeDropIndex(statement);
       case 'Begin':
         return this.executeBegin();
       case 'Commit':
@@ -137,7 +147,165 @@ export class Engine {
       throw new SqlError(ErrorCodes.MISSING_TABLE, `Table "${statement.table}" does not exist.`, { table: statement.table });
     }
     this.tables.delete(key);
+    for (const [indexKey, index] of this.indexes) {
+      if (index.table.toLowerCase() === key) this.indexes.delete(indexKey);
+    }
     return { type: 'drop', changes: 0, table: statement.table };
+  }
+
+  executeAlterTable(statement, bind) {
+    const table = this.requireTable(statement.table);
+    const dialect = this.dialect;
+
+    switch (statement.action) {
+      case 'addColumn': {
+        const definition = statement.column;
+        const key = definition.name.toLowerCase();
+        if (table.columns.some((column) => column.key === key)) {
+          throw new SqlError(
+            ErrorCodes.DUPLICATE_COLUMN,
+            `Table "${table.name}" already has a column named "${definition.name}".`,
+            { table: table.name, columnName: definition.name }
+          );
+        }
+        if (definition.primaryKey) {
+          throw new SqlError(
+            ErrorCodes.INVALID_QUERY,
+            'ALTER TABLE cannot add a column declared PRIMARY KEY.'
+          );
+        }
+        const type = dialect.resolveType(definition.type, definition.args);
+        const column = {
+          name: definition.name,
+          key,
+          type,
+          notNull: Boolean(definition.notNull),
+          primaryKey: false,
+          unique: Boolean(definition.unique),
+          autoIncrement: Boolean(definition.autoIncrement) || Boolean(type.autoincrement),
+          defaultValue: undefined
+        };
+        if (definition.defaultExpr) {
+          if (containsColumnReference(definition.defaultExpr) || containsParameter(definition.defaultExpr)) {
+            throw new SqlError(
+              ErrorCodes.INVALID_QUERY,
+              `DEFAULT for column "${definition.name}" must be a constant expression.`,
+              { table: table.name, columnName: definition.name }
+            );
+          }
+          const raw = evaluate(definition.defaultExpr, this.context(null, null, bind), this);
+          column.defaultValue = dialect.coerceColumnValue(raw, column);
+        }
+        if (column.notNull && column.defaultValue === undefined) {
+          throw new SqlError(
+            ErrorCodes.INVALID_QUERY,
+            `Cannot add NOT NULL column "${column.name}" to table "${table.name}" without a DEFAULT.`,
+            { table: table.name, columnName: column.name }
+          );
+        }
+        table.columns = [...table.columns, column];
+        for (const row of table.rows) {
+          row[key] = column.defaultValue === undefined ? null : column.defaultValue;
+        }
+        return { type: 'alter', table: table.name, action: 'addColumn', changes: 0 };
+      }
+
+      case 'dropColumn': {
+        const key = this.columnKey(table.name, table.columns, statement.columnName);
+        if (table.columns.length === 1) {
+          throw new SqlError(
+            ErrorCodes.INVALID_QUERY,
+            `Table "${table.name}" must keep at least one column.`,
+            { table: table.name }
+          );
+        }
+        table.columns = table.columns.filter((column) => column.key !== key);
+        for (const row of table.rows) delete row[key];
+        table.uniques = table.uniques
+          .map((columns) => columns.filter((column) => column !== key))
+          .filter((columns) => columns.length > 0);
+        table.primaryKey = table.primaryKey.filter((column) => column !== key);
+        return { type: 'alter', table: table.name, action: 'dropColumn', changes: 0 };
+      }
+
+      case 'renameTable': {
+        const newKey = String(statement.newName).toLowerCase();
+        if (this.tables.has(newKey)) {
+          throw new SqlError(
+            ErrorCodes.TABLE_EXISTS,
+            `Table "${statement.newName}" already exists.`,
+            { table: statement.newName }
+          );
+        }
+        this.tables.delete(table.name.toLowerCase());
+        table.name = statement.newName;
+        this.tables.set(newKey, table);
+        for (const index of this.indexes.values()) {
+          if (index.table.toLowerCase() === newKey) index.table = statement.newName;
+        }
+        return { type: 'alter', table: table.name, action: 'renameTable', changes: 0 };
+      }
+
+      case 'renameColumn': {
+        const key = this.columnKey(table.name, table.columns, statement.columnName);
+        const newKey = String(statement.newName).toLowerCase();
+        if (table.columns.some((column) => column.key === newKey)) {
+          throw new SqlError(
+            ErrorCodes.DUPLICATE_COLUMN,
+            `Table "${table.name}" already has a column named "${statement.newName}".`,
+            { table: table.name, columnName: statement.newName }
+          );
+        }
+        const column = table.columns.find((entry) => entry.key === key);
+        column.name = statement.newName;
+        column.key = newKey;
+        for (const row of table.rows) {
+          row[newKey] = row[key];
+          delete row[key];
+        }
+        const rename = (columns) => columns.map((entry) => (entry === key ? newKey : entry));
+        table.uniques = table.uniques.map(rename);
+        table.primaryKey = rename(table.primaryKey);
+        return { type: 'alter', table: table.name, action: 'renameColumn', changes: 0 };
+      }
+
+      default:
+        throw new SqlError(ErrorCodes.INVALID_QUERY, `Unknown ALTER TABLE action ${statement.action}.`);
+    }
+  }
+
+  executeCreateIndex(statement) {
+    const table = this.requireTable(statement.table);
+    const key = String(statement.name).toLowerCase();
+    if (this.indexes.has(key)) {
+      if (statement.ifNotExists) {
+        return { type: 'createIndex', table: table.name, changes: 0 };
+      }
+      throw new SqlError(
+        ErrorCodes.INVALID_QUERY,
+        `Index "${statement.name}" already exists.`,
+        { table: table.name }
+      );
+    }
+    const columns = statement.columns.map((name) => this.columnKey(table.name, table.columns, name));
+    this.indexes.set(key, {
+      name: statement.name,
+      table: table.name,
+      columns,
+      unique: Boolean(statement.unique)
+    });
+    return { type: 'createIndex', table: table.name, changes: 0 };
+  }
+
+  executeDropIndex(statement) {
+    const key = String(statement.name).toLowerCase();
+    if (!this.indexes.has(key)) {
+      if (statement.ifExists) return { type: 'dropIndex', changes: 0 };
+      throw new SqlError(ErrorCodes.INVALID_QUERY, `Index "${statement.name}" does not exist.`);
+    }
+    const index = this.indexes.get(key);
+    this.indexes.delete(key);
+    return { type: 'dropIndex', table: index.table, changes: 0 };
   }
 
   /** Resolve a column name inside CREATE TABLE constraints. */
@@ -156,15 +324,30 @@ export class Engine {
   // ----------------------------------------------------------------- SELECT
 
   executeSelect(statement, bind) {
+    const result = this.select(statement, bind, null);
+    return { type: 'select', columns: result.columns, rows: result.rows };
+  }
+
+  /**
+   * Run a SELECT and return its projected rows.
+   *
+   * `outer` is the context of an enclosing statement; it is what makes a
+   * correlated subquery able to read columns from the outer query.
+   *
+   * @param {object} statement
+   * @param {(token: object) => unknown} bind
+   * @param {object|null} outer
+   */
+  select(statement, bind, outer = null) {
     const dialect = this.dialect;
-    const source = this.buildSource(statement.from, statement.joins, bind);
+    const source = this.buildSource(statement.from, statement.joins, bind, outer);
 
     let filtered;
     if (!source) {
       filtered = [null];
     } else if (statement.where) {
       filtered = source.rows.filter((row) => {
-        const value = evaluate(statement.where, this.context(row, null, bind), this, source);
+        const value = evaluate(statement.where, this.context(row, null, bind, source, outer), this, source);
         return dialect.predicate(value) === true;
       });
     } else {
@@ -185,12 +368,12 @@ export class Engine {
       if (statement.groupBy.length === 0) {
         groups = [filtered];
       } else {
-        const groupExprs = statement.groupBy.map((expr) => resolveAliases(expr, selectItems));
-        groups = groupRows(filtered, groupExprs, this, bind, source);
+        const groupExprs = statement.groupBy.map((expr) => resolveOutputExpression(expr, selectItems));
+        groups = groupRows(filtered, groupExprs, this, bind, source, outer);
       }
-      contexts = groups.map((group) => ({ row: group.length > 0 ? group[0] : null, group }));
+      contexts = groups.map((group) => this.context(group.length > 0 ? group[0] : null, group, bind, source, outer));
     } else {
-      contexts = filtered.map((row) => ({ row, group: null }));
+      contexts = filtered.map((row) => this.context(row, null, bind, source, outer));
     }
 
     // Resolve output names, expanding "*" or "alias.*" against the source.
@@ -223,8 +406,8 @@ export class Engine {
     const projected = [];
     for (const context of contexts) {
       if (statement.having) {
-        const having = resolveAliases(statement.having, selectItems);
-        const value = evaluate(having, this.context(context.row, context.group, bind), this, source);
+        const having = resolveOutputExpression(statement.having, selectItems);
+        const value = evaluate(having, context, this, source);
         if (dialect.predicate(value) !== true) continue;
       }
       const record = {};
@@ -232,7 +415,7 @@ export class Engine {
         if (item.binding) {
           record[item.name] = readBinding(context.row, item.binding);
         } else {
-          record[item.name] = evaluate(item.expr, this.context(context.row, context.group, bind), this, source);
+          record[item.name] = evaluate(item.expr, context, this, source);
         }
       }
       projected.push({ record, context });
@@ -241,10 +424,10 @@ export class Engine {
     let results = statement.distinct ? distinctRecords(projected) : projected;
 
     if (statement.orderBy.length > 0) {
-      const keys = statement.orderBy.map((item) => resolveAliases(item.expr, statement.columns));
+      const keys = statement.orderBy.map((item) => resolveOutputExpression(item.expr, statement.columns));
       const decorated = results.map((entry) => ({
         entry,
-        sortKeys: keys.map((expr) => evaluate(expr, this.context(entry.context.row, entry.context.group, bind), this, source))
+        sortKeys: keys.map((expr) => evaluate(expr, entry.context, this, source))
       }));
       decorated.sort((a, b) => compareSortKeys(a.sortKeys, b.sortKeys, statement.orderBy, dialect));
       results = decorated.map((entry) => entry.entry);
@@ -259,7 +442,6 @@ export class Engine {
     }
 
     return {
-      type: 'select',
       columns: outputItems.map((item) => item.name),
       rows: results.map((entry) => entry.record)
     };
@@ -273,10 +455,11 @@ export class Engine {
    * stored under `alias\0column` and reported as `alias.column`.
    *
    * @param {{table: string, alias: string|null}|null} from
-   * @param {{kind: 'inner'|'left', table: string, alias: string|null, on: object}[]} joins
+   * @param {{kind: 'inner'|'left'|'right'|'full'|'cross', table: string, alias: string|null, on: object|null}[]} joins
    * @param {(token: object) => unknown} bind
+   * @param {object|null} outer context of an enclosing statement
    */
-  buildSource(from, joins, bind) {
+  buildSource(from, joins, bind, outer = null) {
     if (!from) return null;
 
     const sources = [];
@@ -333,20 +516,42 @@ export class Engine {
       const join = joins[i];
       const rightRows = rowSets[i + 1];
       const emptyRight = sourceRows(sources[i + 1], null);
+      const emptyLeft = {};
+      for (const binding of sources.slice(0, i + 1).flatMap((entry) => entry.bindings)) {
+        emptyLeft[binding.slot] = null;
+      }
+      const visible = sources.slice(0, i + 2).flatMap((entry) => entry.bindings);
+      const rightMatched = new Set();
       const merged = [];
+
       for (const left of rows) {
         let matched = false;
-        for (const right of rightRows) {
-          const combined = { ...left, ...right };
-          const visible = sources.slice(0, i + 2).flatMap((entry) => entry.bindings);
-          const value = evaluate(join.on, this.context(combined, null, bind), this, { bindings: visible });
+        for (let r = 0; r < rightRows.length; r += 1) {
+          const combined = { ...left, ...rightRows[r] };
+          if (join.kind === 'cross') {
+            merged.push(combined);
+            matched = true;
+            continue;
+          }
+          const scope = { bindings: visible };
+          const value = evaluate(join.on, this.context(combined, null, bind, scope, outer), this, scope);
           if (this.dialect.predicate(value) === true) {
             merged.push(combined);
             matched = true;
+            rightMatched.add(r);
           }
         }
-        if (!matched && join.kind === 'left') merged.push({ ...left, ...emptyRight });
+        if (!matched && (join.kind === 'left' || join.kind === 'full')) {
+          merged.push({ ...left, ...emptyRight });
+        }
       }
+
+      if (join.kind === 'right' || join.kind === 'full') {
+        for (let r = 0; r < rightRows.length; r += 1) {
+          if (!rightMatched.has(r)) merged.push({ ...emptyLeft, ...rightRows[r] });
+        }
+      }
+
       rows = merged;
     }
 
@@ -363,6 +568,7 @@ export class Engine {
       );
     }
     this.transactionSnapshot = this.snapshotTables();
+    this.indexSnapshot = new Map([...this.indexes].map(([key, index]) => [key, { ...index }]));
     return { type: 'begin', changes: 0 };
   }
 
@@ -371,6 +577,7 @@ export class Engine {
       throw new SqlError(ErrorCodes.INVALID_QUERY, 'COMMIT without an active transaction.');
     }
     this.transactionSnapshot = null;
+    this.indexSnapshot = null;
     return { type: 'commit', changes: 0 };
   }
 
@@ -379,7 +586,9 @@ export class Engine {
       throw new SqlError(ErrorCodes.INVALID_QUERY, 'ROLLBACK without an active transaction.');
     }
     this.tables = this.transactionSnapshot;
+    if (this.indexSnapshot) this.indexes = this.indexSnapshot;
     this.transactionSnapshot = null;
+    this.indexSnapshot = null;
     return { type: 'rollback', changes: 0 };
   }
 
@@ -388,8 +597,8 @@ export class Engine {
     for (const [key, table] of this.tables) {
       copy.set(key, {
         ...table,
-        columns: table.columns.slice(),
-        rows: table.rows.slice(),
+        columns: table.columns.map((column) => ({ ...column })),
+        rows: table.rows.map((row) => ({ ...row })),
         uniques: table.uniques.map((entry) => entry.slice()),
         primaryKey: table.primaryKey.slice()
       });
@@ -444,7 +653,7 @@ export class Engine {
       for (const column of table.columns) row[column.key] = column.defaultValue === undefined ? null : column.defaultValue;
 
       columnKeys.forEach((key, index) => {
-        row[key] = evaluate(valueExprs[index], this.context(null, null, bind), this, scope);
+        row[key] = evaluate(valueExprs[index], this.context(null, null, bind, scope), this, scope);
       });
 
       for (const column of table.columns) {
@@ -508,13 +717,13 @@ export class Engine {
 
     const rows = table.rows.map((row) => {
       if (statement.where) {
-        const value = evaluate(statement.where, this.context(row, null, bind), this, scope);
+        const value = evaluate(statement.where, this.context(row, null, bind, scope), this, scope);
         if (dialect.predicate(value) !== true) return row;
       }
       const updated = { ...row };
       for (const assignment of assignments) {
         const column = table.columns.find((entry) => entry.key === assignment.key);
-        const raw = evaluate(assignment.expr, this.context(row, null, bind), this, scope);
+        const raw = evaluate(assignment.expr, this.context(row, null, bind, scope), this, scope);
         if (raw === null || raw === undefined) {
           updated[assignment.key] = null;
         } else {
@@ -552,7 +761,7 @@ export class Engine {
       return { type: 'delete', table: table.name, changes };
     }
     const remaining = table.rows.filter((row) => {
-      const value = evaluate(statement.where, this.context(row, null, bind), this, scope);
+      const value = evaluate(statement.where, this.context(row, null, bind, scope), this, scope);
       return dialect.predicate(value) !== true;
     });
     const changes = table.rows.length - remaining.length;
@@ -562,8 +771,15 @@ export class Engine {
 
   // ------------------------------------------------------------- evaluation
 
-  context(row, group, bind) {
-    return { row, group, bind, engine: this };
+  /**
+   * Build an evaluation context.
+   *
+   * `source` is the row scope visible here and `outer` links to the context of
+   * an enclosing statement, which is how correlated subqueries resolve names
+   * that their own FROM clause does not define.
+   */
+  context(row, group, bind, source = null, outer = null) {
+    return { row, group, bind, engine: this, source, outer };
   }
 
   /**
@@ -581,10 +797,10 @@ export class Engine {
 // Table helpers
 // ---------------------------------------------------------------------------
 
-function groupRows(rows, groupBy, engine, bind, table) {
+function groupRows(rows, groupBy, engine, bind, table, outer = null) {
   const groupsByKey = new Map();
   for (const row of rows) {
-    const values = groupBy.map((expr) => evaluate(expr, engine.context(row, null, bind), engine, table));
+    const values = groupBy.map((expr) => evaluate(expr, engine.context(row, null, bind, table, outer), engine, table));
     const key = values.map(valueKey).join('\u0000');
     if (!groupsByKey.has(key)) groupsByKey.set(key, []);
     groupsByKey.get(key).push(row);
@@ -712,13 +928,71 @@ function evaluate(expr, context, engine, table) {
       return expr.negated ? !result : result;
     }
 
+    case 'Case': {
+      if (expr.operand) {
+        const subject = evaluate(expr.operand, context, engine, table);
+        for (const branch of expr.branches) {
+          const candidate = evaluate(branch.when, context, engine, table);
+          if (subject === null || candidate === null) continue;
+          if (dialect.compare(subject, candidate) === 0) {
+            return evaluate(branch.then, context, engine, table);
+          }
+        }
+      } else {
+        for (const branch of expr.branches) {
+          if (dialect.predicate(evaluate(branch.when, context, engine, table)) === true) {
+            return evaluate(branch.then, context, engine, table);
+          }
+        }
+      }
+      return expr.else ? evaluate(expr.else, context, engine, table) : null;
+    }
+
+    case 'Cast':
+      return dialect.castValue(evaluate(expr.operand, context, engine, table), expr.targetType);
+
+    case 'Subquery': {
+      const result = engine.select(expr.select, context.bind, context);
+      if (result.columns.length !== 1) {
+        throw new SqlError(
+          ErrorCodes.INVALID_QUERY,
+          'A subquery used as an expression must return exactly one column.'
+        );
+      }
+      if (result.rows.length > 1) {
+        throw new SqlError(
+          ErrorCodes.INVALID_QUERY,
+          'A subquery used as an expression must return at most one row.'
+        );
+      }
+      if (result.rows.length === 0) return null;
+      return result.rows[0][result.columns[0]] ?? null;
+    }
+
+    case 'Exists': {
+      const result = engine.select(expr.select, context.bind, context);
+      return result.rows.length > 0;
+    }
+
     case 'In': {
       const value = evaluate(expr.operand, context, engine, table);
       if (value === null) return null;
+      let candidates;
+      if (expr.subquery) {
+        const result = engine.select(expr.subquery, context.bind, context);
+        if (result.columns.length !== 1) {
+          throw new SqlError(
+            ErrorCodes.INVALID_QUERY,
+            'A subquery used with IN must return exactly one column.'
+          );
+        }
+        candidates = result.rows.map((row) => row[result.columns[0]] ?? null);
+      } else {
+        candidates = expr.list.map((item) => evaluate(item, context, engine, table));
+      }
       let sawNull = false;
       let matched = false;
-      for (const item of expr.list) {
-        const candidate = evaluate(item, context, engine, table);
+      for (const candidate of candidates) {
         if (candidate === null) {
           sawNull = true;
           continue;
@@ -856,38 +1130,25 @@ function modulo(dialect, left, right) {
   return a % b;
 }
 
-function resolveColumn(expr, context, source) {
-  if (!source) {
-    throw new SqlError(
-      ErrorCodes.MISSING_COLUMN,
-      `Column "${expr.name}" cannot be used without a FROM clause.`,
-      { columnName: expr.name }
-    );
-  }
+/** Sentinel returned when a column name is absent from one row scope. */
+const NO_COLUMN = Symbol('no column');
+
+/**
+ * Look a column up in a single scope, or return NO_COLUMN.
+ * Ambiguous references still raise, because qualification is the fix.
+ */
+function lookupColumn(expr, context, source) {
+  if (!source) return NO_COLUMN;
   const key = expr.name.toLowerCase();
   let candidates = source.bindings.filter((binding) => binding.key === key);
 
   if (expr.table) {
     const alias = expr.table.toLowerCase();
-    if (!source.bindings.some((binding) => binding.alias === alias)) {
-      throw new SqlError(
-        ErrorCodes.MISSING_COLUMN,
-        `Table or alias "${expr.table}" is not in scope.`,
-        { table: expr.table, columnName: expr.name }
-      );
-    }
+    if (!source.bindings.some((binding) => binding.alias === alias)) return NO_COLUMN;
     candidates = candidates.filter((binding) => binding.alias === alias);
   }
 
-  if (candidates.length === 0) {
-    const aliases = [...new Set(source.bindings.map((binding) => binding.alias))];
-    const where = aliases.length === 1 ? `Table "${aliases[0]}"` : 'The FROM clause';
-    throw new SqlError(
-      ErrorCodes.MISSING_COLUMN,
-      `${where} has no column named "${expr.name}".`,
-      { columnName: expr.name }
-    );
-  }
+  if (candidates.length === 0) return NO_COLUMN;
   if (candidates.length > 1) {
     throw new SqlError(
       ErrorCodes.INVALID_QUERY,
@@ -895,8 +1156,40 @@ function resolveColumn(expr, context, source) {
       { columnName: expr.name }
     );
   }
+  return readBinding(context ? context.row : null, candidates[0]);
+}
 
-  return readBinding(context.row, candidates[0]);
+function resolveColumn(expr, context, source) {
+  const value = lookupColumn(expr, context, source);
+  if (value !== NO_COLUMN) return value;
+
+  // Correlated subqueries fall back to the enclosing query's scopes.
+  for (let scope = context ? context.outer : null; scope; scope = scope.outer) {
+    const outerValue = lookupColumn(expr, scope, scope.source);
+    if (outerValue !== NO_COLUMN) return outerValue;
+  }
+
+  if (expr.table) {
+    throw new SqlError(
+      ErrorCodes.MISSING_COLUMN,
+      `Table or alias "${expr.table}" is not in scope.`,
+      { table: expr.table, columnName: expr.name }
+    );
+  }
+  if (!source) {
+    throw new SqlError(
+      ErrorCodes.MISSING_COLUMN,
+      `Column "${expr.name}" cannot be used without a FROM clause.`,
+      { columnName: expr.name }
+    );
+  }
+  const aliases = [...new Set(source.bindings.map((binding) => binding.alias))];
+  const where = aliases.length === 1 ? `Table "${aliases[0]}"` : 'The FROM clause';
+  throw new SqlError(
+    ErrorCodes.MISSING_COLUMN,
+    `${where} has no column named "${expr.name}".`,
+    { columnName: expr.name }
+  );
 }
 
 /** Read the value of a source binding from a merged row. */
@@ -937,7 +1230,7 @@ function evaluateAggregate(expr, context, engine, table) {
   }
 
   const args = expr.args;
-  const values = group.map((row) => evaluate(args[0], engine.context(row, null, context.bind), engine, table));
+  const values = group.map((row) => evaluate(args[0], engine.context(row, null, context.bind, table, context), engine, table));
 
   switch (expr.name) {
     case 'COUNT':
@@ -1018,6 +1311,22 @@ function evaluateScalar(name, args, dialect) {
 }
 
 /**
+ * Resolve a GROUP BY / HAVING / ORDER BY expression, accepting select-list
+ * ordinals (`ORDER BY 2 DESC`) in addition to output aliases.
+ */
+function resolveOutputExpression(expr, selectItems) {
+  if (expr && expr.type === 'Literal' && typeof expr.value === 'number' && !expr.real) {
+    const position = expr.value;
+    if (Number.isInteger(position) && position >= 1 && position <= selectItems.length) {
+      const item = selectItems[position - 1];
+      if (item.expr.type !== 'Star') return item.expr;
+    }
+    return expr;
+  }
+  return resolveAliases(expr, selectItems);
+}
+
+/**
  * Replace bare output aliases with their expressions. Used by GROUP BY,
  * HAVING and ORDER BY so `ORDER BY total` and `HAVING total > 10` work.
  */
@@ -1031,7 +1340,15 @@ function resolveAliases(expr, selectItems) {
     });
     return match ? match.expr : expr;
   }
-  if (expr.type === 'Star' || expr.type === 'Literal' || expr.type === 'Parameter') return expr;
+  if (
+    expr.type === 'Star' ||
+    expr.type === 'Literal' ||
+    expr.type === 'Parameter' ||
+    expr.type === 'Subquery' ||
+    expr.type === 'Exists'
+  ) {
+    return expr;
+  }
 
   const copy = { ...expr };
   for (const key of Object.keys(copy)) {

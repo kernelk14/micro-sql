@@ -111,12 +111,8 @@ test('joins report ambiguous, unknown and unsupported references', () => {
     (error) => error.code === ErrorCodes.SYNTAX_ERROR
   );
   assert.throws(
-    () => db.all('SELECT * FROM users JOIN posts USING (id)'),
-    (error) => error.code === ErrorCodes.UNSUPPORTED
-  );
-  assert.throws(
-    () => db.all('SELECT * FROM users RIGHT JOIN posts ON users.id = posts.author_id'),
-    (error) => error.code === ErrorCodes.UNSUPPORTED
+    () => db.all('SELECT u.id FROM users u JOIN posts p USING (nope)'),
+    (error) => error.code === ErrorCodes.MISSING_COLUMN
   );
 });
 

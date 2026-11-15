@@ -19,7 +19,9 @@ const BASE_KEYWORDS = [
   'CREATE', 'TABLE', 'DROP', 'IF', 'EXISTS', 'PRIMARY', 'KEY', 'UNIQUE', 'DEFAULT',
   'TRUE', 'FALSE', 'NULLS', 'FIRST', 'LAST', 'PRECISION', 'VARYING',
   'JOIN', 'INNER', 'LEFT', 'OUTER', 'RIGHT', 'FULL', 'CROSS', 'ON', 'USING',
-  'BEGIN', 'COMMIT', 'ROLLBACK', 'TRANSACTION'
+  'BEGIN', 'COMMIT', 'ROLLBACK', 'TRANSACTION',
+  'CASE', 'WHEN', 'THEN', 'ELSE', 'END', 'CAST', 'ALTER', 'ADD', 'COLUMN',
+  'RENAME', 'TO', 'INDEX'
 ];
 
 const BASE_TYPES = {
@@ -229,6 +231,57 @@ export class BaseDialect {
         return fail();
       case 'boolean':
         if (typeof value === 'boolean') return value;
+        if (typeof value === 'string') {
+          const lowered = value.trim().toLowerCase();
+          if (lowered === 'true' || lowered === 't' || lowered === '1') return true;
+          if (lowered === 'false' || lowered === 'f' || lowered === '0') return false;
+        }
+        return fail();
+      default:
+        return fail();
+    }
+  }
+
+  /**
+   * Convert a runtime value to a canonical type for `CAST(expr AS type)`.
+   * NULL passes through. Text that is not numeric raises `TYPE_ERROR`.
+   * @param {null|number|string|boolean} value
+   * @param {{name: string, family: 'integer'|'real'|'text'|'boolean'}} type
+   */
+  castValue(value, type) {
+    if (value === null || value === undefined) return null;
+    const fail = () => {
+      throw new SqlError(
+        ErrorCodes.TYPE_ERROR,
+        `Cannot cast ${describeValue(value)} to ${type.name} in the ${this.name} dialect.`
+      );
+    };
+    switch (type.family) {
+      case 'integer':
+        if (typeof value === 'number' && Number.isFinite(value)) return Math.trunc(value);
+        if (typeof value === 'boolean') return value ? 1 : 0;
+        if (typeof value === 'string') {
+          const parsed = parseNumericText(value);
+          if (parsed !== null) return Math.trunc(parsed);
+        }
+        return fail();
+      case 'real':
+        if (typeof value === 'number' && Number.isFinite(value)) return value;
+        if (typeof value === 'boolean') return value ? 1 : 0;
+        if (typeof value === 'string') {
+          const parsed = parseNumericText(value);
+          if (parsed !== null) return parsed;
+        }
+        return fail();
+      case 'text':
+        return this.toText(value);
+      case 'boolean':
+        if (typeof value === 'boolean') return value;
+        if (typeof value === 'number') {
+          if (value === 0) return false;
+          if (value === 1) return true;
+          return fail();
+        }
         if (typeof value === 'string') {
           const lowered = value.trim().toLowerCase();
           if (lowered === 'true' || lowered === 't' || lowered === '1') return true;

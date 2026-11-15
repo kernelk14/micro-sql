@@ -77,9 +77,11 @@ export class Parser {
       case 'DELETE':
         return this.parseDelete();
       case 'CREATE':
-        return this.parseCreateTable();
+        return this.parseCreate();
       case 'DROP':
-        return this.parseDropTable();
+        return this.parseDrop();
+      case 'ALTER':
+        return this.parseAlterTable();
       case 'BEGIN':
         return this.parseBegin();
       case 'COMMIT':
@@ -108,7 +110,7 @@ export class Parser {
     const joins = [];
     if (this.matchKeyword('FROM')) {
       from = this.parseTableRef();
-      this.parseJoins(joins);
+      this.parseJoins(joins, from);
     }
 
     let where = null;
@@ -294,14 +296,10 @@ export class Parser {
     return { table, alias };
   }
 
-  parseJoins(joins) {
+  parseJoins(joins, from) {
     for (;;) {
       const token = this.peek();
       if (token.type !== 'keyword') return;
-
-      if (token.value === 'RIGHT' || token.value === 'FULL' || token.value === 'CROSS') {
-        throw unsupported(`${token.value} JOIN is not supported; use INNER JOIN or LEFT JOIN.`);
-      }
 
       let kind = null;
       if (token.value === 'JOIN') {
@@ -316,22 +314,83 @@ export class Parser {
         this.matchKeyword('OUTER');
         this.expectKeyword('JOIN');
         kind = 'left';
+      } else if (token.value === 'RIGHT') {
+        this.next();
+        this.matchKeyword('OUTER');
+        this.expectKeyword('JOIN');
+        kind = 'right';
+      } else if (token.value === 'FULL') {
+        this.next();
+        this.matchKeyword('OUTER');
+        this.expectKeyword('JOIN');
+        kind = 'full';
+      } else if (token.value === 'CROSS') {
+        this.next();
+        this.expectKeyword('JOIN');
+        kind = 'cross';
       }
       if (!kind) return;
 
       const ref = this.parseTableRef();
-      if (this.peek().type === 'keyword' && this.peek().value === 'USING') {
-        throw unsupported('JOIN ... USING is not supported; write an ON condition instead.');
+      let on = null;
+      if (kind === 'cross') {
+        if (this.peek().type === 'keyword' && this.peek().value === 'ON') {
+          throw this.unexpected('CROSS JOIN does not take an ON condition');
+        }
+        joins.push({ kind, table: ref.table, alias: ref.alias, on: null });
+        continue;
       }
-      this.expectKeyword('ON');
-      joins.push({ kind, table: ref.table, alias: ref.alias, on: this.parseExpression() });
+
+      if (this.matchKeyword('USING')) {
+        this.expectPunctuation('(');
+        const columns = [];
+        do {
+          columns.push(this.expectIdentifier('Expected a column name').value);
+        } while (this.matchPunctuation(','));
+        this.expectPunctuation(')');
+        on = usingCondition(joins, from, ref, columns);
+      } else {
+        this.expectKeyword('ON');
+        on = this.parseExpression();
+      }
+      joins.push({ kind, table: ref.table, alias: ref.alias, on });
     }
   }
 
   // ----------------------------------------------------------- CREATE TABLE
 
-  parseCreateTable() {
-    this.expectKeyword('CREATE');
+  parseCreate() {
+    const start = this.expectKeyword('CREATE').start;
+    let unique = false;
+    if (this.matchKeyword('UNIQUE')) unique = true;
+    if (this.peek().type === 'keyword' && this.peek().value === 'INDEX') {
+      return this.parseCreateIndex(start, unique);
+    }
+    if (unique) throw this.unexpected('Expected INDEX after UNIQUE');
+    return this.parseCreateTable(start);
+  }
+
+  parseCreateIndex(start, unique) {
+    this.expectKeyword('INDEX');
+    let ifNotExists = false;
+    if (this.matchKeyword('IF')) {
+      this.expectKeyword('NOT');
+      this.expectKeyword('EXISTS');
+      ifNotExists = true;
+    }
+    const name = this.expectIdentifier('Expected an index name').value;
+    this.expectKeyword('ON');
+    const table = this.parseObjectName();
+    this.expectPunctuation('(');
+    const columns = [];
+    do {
+      columns.push(this.expectIdentifier('Expected a column name').value);
+    } while (this.matchPunctuation(','));
+    this.expectPunctuation(')');
+    return { type: 'CreateIndex', name, table, columns, unique, ifNotExists, start };
+  }
+
+  parseCreateTable(start = 0) {
     this.expectKeyword('TABLE');
     let ifNotExists = false;
     if (this.matchKeyword('IF')) {
@@ -387,7 +446,7 @@ export class Parser {
       }
     }
 
-    return { type: 'CreateTable', table, ifNotExists, columns, primaryKey, uniques };
+    return { type: 'CreateTable', table, ifNotExists, columns, primaryKey, uniques, start };
   }
 
   parseColumnDefinition() {
@@ -493,16 +552,68 @@ export class Parser {
 
   // ------------------------------------------------------------------- DROP
 
-  parseDropTable() {
+  parseDrop() {
     this.expectKeyword('DROP');
-    this.expectKeyword('TABLE');
-    let ifExists = false;
-    if (this.matchKeyword('IF')) {
-      this.expectKeyword('EXISTS');
-      ifExists = true;
+    const token = this.peek();
+    if (token.type === 'keyword' && token.value === 'INDEX') return this.parseDropIndex();
+    if (token.type !== 'keyword' || token.value !== 'TABLE') {
+      throw this.unexpected('Expected TABLE or INDEX after DROP');
     }
+    return this.parseDropTable();
+  }
+
+  parseDropTable() {
+    this.expectKeyword('TABLE');
+    const ifExists = this.parseIfExists();
     const table = this.parseObjectName();
     return { type: 'DropTable', table, ifExists };
+  }
+
+  parseDropIndex() {
+    this.expectKeyword('INDEX');
+    const ifExists = this.parseIfExists();
+    const name = this.expectIdentifier('Expected an index name').value;
+    return { type: 'DropIndex', name, ifExists };
+  }
+
+  parseIfExists() {
+    if (this.matchKeyword('IF')) {
+      this.expectKeyword('EXISTS');
+      return true;
+    }
+    return false;
+  }
+
+  parseAlterTable() {
+    const start = this.expectKeyword('ALTER').start;
+    this.expectKeyword('TABLE');
+    const table = this.parseObjectName();
+    const token = this.peek();
+    if (token.type !== 'keyword') throw this.unexpected('Expected ADD, DROP or RENAME after ALTER TABLE');
+
+    if (token.value === 'ADD') {
+      this.next();
+      this.matchKeyword('COLUMN');
+      return { type: 'AlterTable', action: 'addColumn', table, column: this.parseColumnDefinition(), start };
+    }
+    if (token.value === 'DROP') {
+      this.next();
+      this.matchKeyword('COLUMN');
+      const columnName = this.expectIdentifier('Expected a column name').value;
+      return { type: 'AlterTable', action: 'dropColumn', table, columnName, start };
+    }
+    if (token.value === 'RENAME') {
+      this.next();
+      if (this.matchKeyword('TO')) {
+        return { type: 'AlterTable', action: 'renameTable', table, newName: this.parseObjectName(), start };
+      }
+      this.matchKeyword('COLUMN');
+      const columnName = this.expectIdentifier('Expected a column name').value;
+      this.expectKeyword('TO');
+      const newName = this.expectIdentifier('Expected a new column name').value;
+      return { type: 'AlterTable', action: 'renameColumn', table, columnName, newName, start };
+    }
+    throw this.unexpected('Expected ADD, DROP or RENAME after ALTER TABLE');
   }
 
   // ------------------------------------------------------------ expressions
@@ -567,6 +678,12 @@ export class Parser {
 
       if (this.matchKeyword('IN')) {
         this.expectPunctuation('(');
+        if (this.peek().type === 'keyword' && this.peek().value === 'SELECT') {
+          const subquery = this.parseSelect();
+          this.expectPunctuation(')');
+          left = { type: 'In', operand: left, negated, list: null, subquery };
+          continue;
+        }
         if (this.matchPunctuation(')')) {
           throw this.unexpected('IN requires at least one value');
         }
@@ -575,7 +692,7 @@ export class Parser {
           list.push(this.parseExpression());
         } while (this.matchPunctuation(','));
         this.expectPunctuation(')');
-        left = { type: 'In', operand: left, negated, list };
+        left = { type: 'In', operand: left, negated, list, subquery: null };
         continue;
       }
 
@@ -679,6 +796,18 @@ export class Parser {
     }
 
     if (token.type === 'keyword') {
+      if (token.value === 'CASE') return this.parseCase();
+      if (token.value === 'CAST') return this.parseCast();
+      if (token.value === 'EXISTS') {
+        this.next();
+        this.expectPunctuation('(');
+        if (!(this.peek().type === 'keyword' && this.peek().value === 'SELECT')) {
+          throw this.unexpected('Expected SELECT after EXISTS (');
+        }
+        const select = this.parseSelect();
+        this.expectPunctuation(')');
+        return { type: 'Exists', select };
+      }
       if (token.value === 'NULL') {
         this.next();
         return { type: 'Literal', value: null };
@@ -692,6 +821,11 @@ export class Parser {
 
     if (token.type === 'punctuation' && token.value === '(') {
       this.next();
+      if (this.peek().type === 'keyword' && this.peek().value === 'SELECT') {
+        const select = this.parseSelect();
+        this.expectPunctuation(')');
+        return { type: 'Subquery', select };
+      }
       const expr = this.parseExpression();
       this.expectPunctuation(')');
       return expr;
@@ -711,6 +845,38 @@ export class Parser {
     }
 
     throw this.unexpected('Expected an expression');
+  }
+
+  parseCase() {
+    this.expectKeyword('CASE');
+    let operand = null;
+    if (!(this.peek().type === 'keyword' && this.peek().value === 'WHEN')) {
+      operand = this.parseExpression();
+    }
+    const branches = [];
+    while (this.matchKeyword('WHEN')) {
+      const when = this.parseExpression();
+      this.expectKeyword('THEN');
+      const then = this.parseExpression();
+      branches.push({ when, then });
+    }
+    if (branches.length === 0) {
+      throw this.unexpected('CASE requires at least one WHEN branch');
+    }
+    let otherwise = null;
+    if (this.matchKeyword('ELSE')) otherwise = this.parseExpression();
+    this.expectKeyword('END');
+    return { type: 'Case', operand, branches, else: otherwise };
+  }
+
+  parseCast() {
+    this.expectKeyword('CAST');
+    this.expectPunctuation('(');
+    const operand = this.parseExpression();
+    this.expectKeyword('AS');
+    const type = this.parseTypeName();
+    this.expectPunctuation(')');
+    return { type: 'Cast', operand, targetType: this.dialect.resolveType(type.name, type.args) };
   }
 
   parseFunctionCall(nameToken) {
@@ -879,6 +1045,32 @@ export function defaultColumnName(expr, text) {
 }
 
 /**
+ * Build the implicit `ON` condition for `JOIN ... USING (a, b)`.
+ * @param {{alias: string|null, table: string}[]} joins
+ * @param {{alias: string|null, table: string}|null} from
+ * @param {{alias: string|null, table: string}} ref
+ * @param {string[]} columns
+ */
+function usingCondition(joins, from, ref, columns) {
+  const leftRef = joins.length > 0 ? joins[joins.length - 1] : from;
+  const leftName = String(leftRef.alias || leftRef.table);
+  const rightName = String(ref.alias || ref.table);
+  let condition = null;
+  for (const name of columns) {
+    const equality = {
+      type: 'Binary',
+      op: '=',
+      left: { type: 'Column', table: leftName, name },
+      right: { type: 'Column', table: rightName, name }
+    };
+    condition = condition
+      ? { type: 'Logical', op: 'AND', left: condition, right: equality }
+      : equality;
+  }
+  return condition;
+}
+
+/**
  * Whether an expression tree contains an aggregate function call.
  * @param {object|null} expr
  * @returns {boolean}
@@ -901,7 +1093,22 @@ export function containsAggregate(expr) {
     case 'Between':
       return containsAggregate(expr.operand) || containsAggregate(expr.low) || containsAggregate(expr.high);
     case 'In':
-      return containsAggregate(expr.operand) || expr.list.some(containsAggregate);
+      return (
+        containsAggregate(expr.operand) ||
+        (expr.list ? expr.list.some(containsAggregate) : false)
+      );
+    case 'Case':
+      return (
+        containsAggregate(expr.operand) ||
+        expr.branches.some((branch) => containsAggregate(branch.when) || containsAggregate(branch.then)) ||
+        containsAggregate(expr.else)
+      );
+    case 'Cast':
+      return containsAggregate(expr.operand);
+    // A subquery is its own scope: its aggregates do not group the outer query.
+    case 'Subquery':
+    case 'Exists':
+      return false;
     default:
       return false;
   }

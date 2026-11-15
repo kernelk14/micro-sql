@@ -80,24 +80,39 @@ finite number and boolean values can be bound.
 ## Supported SQL
 
 - `SELECT [DISTINCT] expr [AS alias], ... [FROM table [[AS] alias]
-  {[INNER] JOIN | LEFT [OUTER] JOIN} table [[AS] alias] ON expr ...]
+  {[INNER] JOIN | LEFT|RIGHT|FULL [OUTER] JOIN | CROSS JOIN} table
+  [[AS] alias] {ON expr | USING (columns)} ...]
   [WHERE ...] [GROUP BY ...] [HAVING ...] [ORDER BY ... [ASC|DESC]
   [NULLS FIRST|LAST]] [LIMIT n] [OFFSET n]`, including `LIMIT offset, count`
-  where the dialect allows it. `*` and `alias.*` expand source columns.
+  where the dialect allows it. `*` and `alias.*` expand source columns, and
+  `GROUP BY`, `HAVING` and `ORDER BY` accept select-list ordinals.
+- Scalar subqueries `(SELECT ...)`, `[NOT] IN (SELECT ...)` and
+  `[NOT] EXISTS (SELECT ...)`, correlated or not. A scalar subquery must
+  return one column and at most one row.
+- `CASE [expr] WHEN ... THEN ... [ELSE ...] END` and
+  `CAST(expr AS TYPE)`.
 - `INSERT INTO t [(columns)] VALUES (...), (...)`.
 - `UPDATE t SET column = expr, ... [WHERE ...]`.
 - `DELETE FROM t [WHERE ...]`.
 - `CREATE TABLE [IF NOT EXISTS] t (column TYPE [PRIMARY KEY [AUTOINCREMENT]]
   [NOT NULL] [UNIQUE] [DEFAULT expr], ..., [PRIMARY KEY (cols)], [UNIQUE (cols)])`.
+- `ALTER TABLE t ADD [COLUMN] column TYPE ...`, `ALTER TABLE t DROP [COLUMN]
+  column`, `ALTER TABLE t RENAME [COLUMN] old TO new`, `ALTER TABLE t RENAME
+  TO name`.
 - `DROP TABLE [IF EXISTS] t`.
+- `CREATE [UNIQUE] INDEX [IF NOT EXISTS] name ON t (columns)` and
+  `DROP INDEX [IF EXISTS] name`. Indexes are tracked as metadata: the store
+  is a plain table scan, so they do not change query plans.
 - `BEGIN [TRANSACTION]`, `COMMIT [TRANSACTION]`, `ROLLBACK [TRANSACTION]`.
 
 ## Joins
 
-`INNER JOIN` (the default for `JOIN`) and `LEFT [OUTER] JOIN` are supported
-with an `ON` condition. Each joined table may have an alias. Unqualified
-columns are an error when both sides define the same name, so duplicate names
-in `SELECT *` are returned as `alias.column`.
+`INNER JOIN` (the default for `JOIN`), `LEFT [OUTER] JOIN`, `RIGHT [OUTER]
+JOIN`, `FULL [OUTER] JOIN` and `CROSS JOIN` are supported. Joined tables take
+an `ON` condition or `USING (column, ...)`, which joins on equal columns of
+the two tables. Each table may have an alias. Unqualified columns are an
+error when both sides define the same name, so duplicate names in `SELECT *`
+are returned as `alias.column`.
 
 ```js
 const rows = db.all(`
@@ -132,8 +147,13 @@ try {
 
 Expressions support `AND`, `OR`, `NOT`, comparisons (`=`, `<>`, `!=`, `<`,
 `<=`, `>`, `>=`), `IS [NOT] NULL/TRUE/FALSE`, `[NOT] IN`, `[NOT] LIKE`,
-`[NOT] BETWEEN`, arithmetic (`+`, `-`, `*`, `/`, `%`), unary `+`/`-` and
-`||` where the dialect supports it. `NULL` follows three-valued logic.
+`[NOT] BETWEEN`, `CASE`, `CAST`, scalar subqueries, arithmetic (`+`, `-`, `*`,
+`/`, `%`), unary `+`/`-` and `||` where the dialect supports it. `NULL`
+follows three-valued logic.
+
+`CAST` converts between the canonical types (`INTEGER`, `REAL`, `TEXT`,
+`BOOLEAN` and each dialect's aliases). Text that is not numeric raises
+`TYPE_ERROR`, and so does a value the target type cannot represent.
 
 Functions:
 
@@ -291,8 +311,8 @@ values (extended query on PostgreSQL, `COM_STMT_PREPARE`/`COM_STMT_EXECUTE`
 on MySQL).
 
 Only the parameters are scanned; the SQL text is not parsed. Statements the
-in-memory engine does not support (`ALTER TABLE`, subqueries, casts) therefore
-pass straight through to the server.
+in-memory engine does not support (for example `WITH` clauses, `CREATE VIEW`
+or window functions) therefore pass straight through to the server.
 
 ### Result decoding
 
@@ -362,9 +382,8 @@ try {
 
 ## Not supported
 
-No subqueries, `RIGHT`/`FULL`/`CROSS JOIN`, `JOIN ... USING`, `ALTER TABLE`,
-indexes, views, savepoints, `HAVING`/`ORDER BY` ordinal positions, `CASE`,
-dates or BLOBs. Unsupported syntax raises `UNSUPPORTED` or `SYNTAX_ERROR`.
+No subqueries in `FROM`, views, savepoints, dates or BLOBs. Unsupported syntax
+raises `UNSUPPORTED` or `SYNTAX_ERROR`.
 
 ## Development
 
